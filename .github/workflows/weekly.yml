@@ -1,8 +1,8 @@
 name: Weekly CI (GPU)
 
 on:
-  schedule:
-    - cron: '0 5 * * SUN' # Runs at 05:00 UTC every Sunday
+  # schedule:
+  #   - cron: '0 5 * * SUN' # Runs at 05:00 UTC every Sunday
   workflow_dispatch: # Allow manual trigger
 
 permissions:
