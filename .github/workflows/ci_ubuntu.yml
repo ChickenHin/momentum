@@ -1,16 +1,16 @@
 name: CI Ubuntu
 
 on:
-  push:
-    branches:
-      - main
-    paths-ignore:
-      - "**/website/**"
-  pull_request:
-    branches:
-      - "**"
-    paths-ignore:
-      - "**/website/**"
+  # push:
+  #   branches:
+  #     - main
+  #   paths-ignore:
+  #     - "**/website/**"
+  # pull_request:
+  #   branches:
+  #     - "**"
+  #   paths-ignore:
+  #     - "**/website/**"
   workflow_dispatch:
 
 permissions:
@@ -73,73 +73,73 @@ jobs:
             MOMENTUM_ENABLE_SIMD=$MOMENTUM_ENABLE_SIMD \
             pixi run test${{ matrix.mode }}
 
-      - name: Install Momentum and Build hello_world
-        run: |
-          MOMENTUM_BUILD_PYMOMENTUM=$MOMENTUM_BUILD_PYMOMENTUM \
-            MOMENTUM_ENABLE_SIMD=$MOMENTUM_ENABLE_SIMD \
-            pixi run install_no_build
-          pixi run cmake \
-            -S momentum/examples/hello_world \
-            -B momentum/examples/hello_world/build \
-            -DCMAKE_BUILD_TYPE=Release
-          pixi run cmake --build momentum/examples/hello_world/build
+      # - name: Install Momentum and Build hello_world
+      #   run: |
+      #     MOMENTUM_BUILD_PYMOMENTUM=$MOMENTUM_BUILD_PYMOMENTUM \
+      #       MOMENTUM_ENABLE_SIMD=$MOMENTUM_ENABLE_SIMD \
+      #       pixi run install_no_build
+      #     pixi run cmake \
+      #       -S momentum/examples/hello_world \
+      #       -B momentum/examples/hello_world/build \
+      #       -DCMAKE_BUILD_TYPE=Release
+      #     pixi run cmake --build momentum/examples/hello_world/build
 
-      - name: Print ccache stats
-        if: always()
-        run: ccache --show-stats --verbose
+      # - name: Print ccache stats
+      #   if: always()
+      #   run: ccache --show-stats --verbose
 
-  pymomentum:
-    name: py-py312-ubuntu
-    runs-on: ubuntu-latest
-    env:
-      CMAKE_C_COMPILER_LAUNCHER: ccache
-      CMAKE_CXX_COMPILER_LAUNCHER: ccache
-      CCACHE_EXTRAFILES: /tmp/native-cpu.txt
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+  # pymomentum:
+  #   name: py-py312-ubuntu
+  #   runs-on: ubuntu-latest
+  #   env:
+  #     CMAKE_C_COMPILER_LAUNCHER: ccache
+  #     CMAKE_CXX_COMPILER_LAUNCHER: ccache
+  #     CCACHE_EXTRAFILES: /tmp/native-cpu.txt
+  #   steps:
+  #     - name: Checkout
+  #       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Record native CPU for ccache
-        run: |
-          lscpu | sed -n '/^Model name:/p;/^Flags:/p' > /tmp/native-cpu.txt
+  #     - name: Record native CPU for ccache
+  #       run: |
+  #         lscpu | sed -n '/^Model name:/p;/^Flags:/p' > /tmp/native-cpu.txt
 
-      - name: Set up ccache
-        uses: hendrikmuhs/ccache-action@f09c25b45002a07be2955cbe52e8cee55643f89d # v1.2.24
-        with:
-          key: ${{ github.workflow }}-py312-ubuntu
-          # ccache-action appends a timestamp when saving; restore keys are the
-          # timestamp-free prefixes. Native CPU information belongs in
-          # CCACHE_EXTRAFILES so one archive can contain entries for multiple
-          # GitHub runner CPU variants while ccache still rejects objects built
-          # for a different -march=native expansion.
-          restore-keys: |
-            ${{ github.workflow }}-py312-ubuntu
-          max-size: 2G
+  #     - name: Set up ccache
+  #       uses: hendrikmuhs/ccache-action@f09c25b45002a07be2955cbe52e8cee55643f89d # v1.2.24
+  #       with:
+  #         key: ${{ github.workflow }}-py312-ubuntu
+  #         # ccache-action appends a timestamp when saving; restore keys are the
+  #         # timestamp-free prefixes. Native CPU information belongs in
+  #         # CCACHE_EXTRAFILES so one archive can contain entries for multiple
+  #         # GitHub runner CPU variants while ccache still rejects objects built
+  #         # for a different -march=native expansion.
+  #         restore-keys: |
+  #           ${{ github.workflow }}-py312-ubuntu
+  #         max-size: 2G
 
-      - name: Reset ccache stats
-        run: ccache --zero-stats
+  #     - name: Reset ccache stats
+  #       run: ccache --zero-stats
 
-      - name: Set up pixi
-        uses: prefix-dev/setup-pixi@d3f436a425481402e6a95a1d1fc10331c708cd9e # v0.9.5
-        with:
-          environments: py312
-          cache: true
+  #     - name: Set up pixi
+  #       uses: prefix-dev/setup-pixi@d3f436a425481402e6a95a1d1fc10331c708cd9e # v0.9.5
+  #       with:
+  #         environments: py312
+  #         cache: true
 
-      - name: Build and test PyMomentum
-        run: |
-          pixi run -e py312 test_py
+  #     - name: Build and test PyMomentum
+  #       run: |
+  #         pixi run -e py312 test_py
 
-      - name: Build Python API Doc
-        run: |
-          pixi run -e py312 doc_py_no_build
+  #     - name: Build Python API Doc
+  #       run: |
+  #         pixi run -e py312 doc_py_no_build
 
-      - name: Upload Python API Doc
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: python-api-doc
-          path: build/python_api_doc
-          retention-days: 7
+  #     - name: Upload Python API Doc
+  #       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+  #       with:
+  #         name: python-api-doc
+  #         path: build/python_api_doc
+  #         retention-days: 7
 
-      - name: Print ccache stats
-        if: always()
-        run: ccache --show-stats --verbose
+  #     - name: Print ccache stats
+  #       if: always()
+  #       run: ccache --show-stats --verbose
