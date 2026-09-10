@@ -1,12 +1,12 @@
 name: Nightly Debug CI
 
 on:
-  schedule:
-    # Run one desktop Debug build per night. Windows gets the extra weekly slot
-    # because the most recent Debug-only breakage was reported there.
-    - cron: '0 4 * * 0,1,4' # Windows Debug: Sun, Mon, Thu
-    - cron: '0 4 * * 2,5' # Ubuntu Debug: Tue, Fri
-    - cron: '0 4 * * 3,6' # macOS Debug: Wed, Sat
+  # schedule:
+  #   # Run one desktop Debug build per night. Windows gets the extra weekly slot
+  #   # because the most recent Debug-only breakage was reported there.
+  #   - cron: '0 4 * * 0,1,4' # Windows Debug: Sun, Mon, Thu
+  #   - cron: '0 4 * * 2,5' # Ubuntu Debug: Tue, Fri
+  #   - cron: '0 4 * * 3,6' # macOS Debug: Wed, Sat
   workflow_dispatch:
     inputs:
       target:
