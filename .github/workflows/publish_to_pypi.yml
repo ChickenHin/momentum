@@ -1,783 +1,783 @@
-# (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
-#
-
-name: PyPI Wheels
-
-on:
-  # Build wheels on pushes to main and version tags
-  push:
-    branches:
-      - main
-    paths-ignore:
-      - "**/website/**"
-    tags:
-      - 'v*'
-
-  # Allow manual trigger for testing builds or publishing
-  workflow_dispatch:
-    inputs:
-      publish:
-        description: 'Publish to PyPI (otherwise just build and test)'
-        required: false
-        type: boolean
-        default: false
-      test_pypi:
-        description: 'Publish to TestPyPI instead of PyPI (for testing)'
-        required: false
-        type: boolean
-        default: false
-      force_all_builds:
-        description: 'Force all builds including py3.13 (simulates tag push behavior)'
-        required: false
-        type: boolean
-        default: false
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
-permissions:
-  contents: read
-
-jobs:
-  # Linux core and CPU wheels are built with cibuildwheel (for manylinux_2_28 compatibility)
-  build_core_and_cpu_wheels_linux:
-    name: pypi-${{ matrix.package-variant }}-linux (cibuildwheel)
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: true
-      matrix:
-        package-variant: [core, cpu]
-
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          submodules: recursive
-          fetch-depth: 0  # Fetch full history for setuptools_scm version detection
-          fetch-tags: true  # Ensure all tags are fetched
-
-      - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: "3.12"
-
-      - name: Install Jinja2
-        run: pip install jinja2
-
-      - name: Generate pyproject.toml
-        run: |
-          python scripts/generate_pyproject.py
-          # Set a default pyproject.toml for the initial cibuildwheel setup.
-          # The generated pyproject uses the full supported Python range so
-          # cibuildwheel does not skip cp313 before the per-build pyproject is
-          # swapped in by the before-build hook.
-          cp pyproject-pypi-${{ matrix.package-variant }}-py312.toml pyproject.toml
-
-      - name: Prepare ccache mount (Linux)
-        run: mkdir -p .ccache
-
-      - name: Cache ccache (Linux)
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: .ccache
-          key: ${{ github.workflow }}-linux-${{ matrix.package-variant }}-${{ hashFiles('pixi.lock', 'pyproject-pypi.toml.j2', 'CMakeLists.txt', 'cmake/**', 'momentum/**', 'pymomentum/**', 'axel/**') }}
-          restore-keys: |
-            ${{ github.workflow }}-linux-${{ matrix.package-variant }}-
-            ${{ github.workflow }}-linux-
-
-      - name: Build wheels
-        uses: pypa/cibuildwheel@1828c10ab37f080699c7b81cea34097c684a7074 # v3.4.2.0
-        env:
-          PYMOMENTUM_VARIANT: ${{ matrix.package-variant }}
-          CIBW_BUILD: ${{ (startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && (github.event.inputs.publish == 'true' || github.event.inputs.force_all_builds == 'true'))) && 'cp312-* cp313-*' || 'cp312-*' }}
-          CIBW_CONTAINER_ENGINE: "docker; create_args: --volume=${{ github.workspace }}/.ccache:/ccache"
-
-      - name: Finalize ccache mount (Linux)
-        run: |
-          if [ ! -d .ccache ] || [ -z "$(ls -A .ccache 2>/dev/null)" ]; then
-            echo "::warning::.ccache was not populated by cibuildwheel; no Linux compiler cache will be saved"
-            exit 0
-          fi
-          # cibuildwheel's manylinux container runs as root, so make the cache
-          # readable by the post-job actions/cache save step on the host.
-          sudo chown -R "$(id -u):$(id -g)" .ccache
-          du -sh .ccache
-
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: wheels-${{ matrix.package-variant }}-linux
-          path: ./wheelhouse/*.whl
-
-  # Core and CPU wheels are built with pixi (non-Linux platforms)
-  # Linux wheels are handled by build_core_and_cpu_wheels_linux above using cibuildwheel
-  build_core_and_cpu_wheels:
-    name: pypi-${{ matrix.package-variant }}-py${{ matrix.python-version }}-${{ matrix.os-short }}
-    runs-on: ${{ matrix.os }}
-    # Force UTF-8 mode on Windows to prevent UnicodeDecodeError in pip resolver
-    env:
-      PYTHONUTF8: "1"
-      PYTHONIOENCODING: "utf-8"
-      SCCACHE_CACHE_SIZE: "2G"
-      SCCACHE_DIR: ${{ github.workspace }}/.sccache
-    strategy:
-      fail-fast: true
-      matrix:
-        os: [macos-15, windows-latest]
-        python-version: ['3.12', '3.13']
-        package-variant: [core, cpu]
-        include:
-          - python-version: '3.12'
-            pixi-environment: py312
-          - python-version: '3.13'
-            pixi-environment: py313
-          - os: macos-15
-            os-short: mac-arm64
-          - os: windows-latest
-            os-short: win64
-    steps:
-      # Skip Python 3.13 builds on regular commits to reduce CI cost
-      # Python 3.13 builds will still run when publishing (tags or manual workflow_dispatch with publish=true)
-      - name: Check if should run
-        id: should_run
-        run: |
-          $run = "${{ matrix.python-version }}" -ne "3.13" -or `
-            "${{ startsWith(github.ref, 'refs/tags/v') }}" -eq "true" -or `
-            "${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.publish == 'true' || github.event.inputs.force_all_builds == 'true') }}" -eq "true"
-          "run=$($run.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-        shell: pwsh
-
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: steps.should_run.outputs.run == 'true'
-        with:
-          submodules: recursive
-          fetch-depth: 0  # Fetch full history for setuptools_scm version detection
-          fetch-tags: true  # Ensure all tags are fetched
-
-      - name: Set up Windows compiler cache
-        if: steps.should_run.outputs.run == 'true' && runner.os == 'Windows'
-        uses: ./.github/actions/setup-windows-sccache
-        with:
-          cache-key: ${{ github.workflow }}-${{ matrix.os }}-sccache-${{ matrix.package-variant }}-py${{ matrix.python-version }}-${{ hashFiles('pixi.lock', 'pyproject-pypi.toml.j2', 'CMakeLists.txt', 'cmake/**', 'momentum/**', 'pymomentum/**', 'axel/**') }}
-          restore-keys: |
-            ${{ github.workflow }}-${{ matrix.os }}-sccache-${{ matrix.package-variant }}-py${{ matrix.python-version }}-
-            ${{ github.workflow }}-${{ matrix.os }}-sccache-${{ matrix.package-variant }}-
-            ${{ github.workflow }}-${{ matrix.os }}-sccache-
-
-      # ccache for macOS
-      - name: Set up ccache (macOS)
-        if: steps.should_run.outputs.run == 'true' && runner.os == 'macOS'
-        uses: hendrikmuhs/ccache-action@f09c25b45002a07be2955cbe52e8cee55643f89d # v1.2.24
-        with:
-          key: ${{ github.workflow }}-${{ matrix.package-variant }}-${{ matrix.os }}-py${{ matrix.python-version }}
-          # ccache-action appends a timestamp when saving; restore keys are the timestamp-free prefixes.
-          restore-keys: |
-            ${{ github.workflow }}-${{ matrix.package-variant }}-${{ matrix.os }}-py${{ matrix.python-version }}
-          max-size: 2G
-
-      - name: Set up pixi
-        if: steps.should_run.outputs.run == 'true'
-        uses: prefix-dev/setup-pixi@d3f436a425481402e6a95a1d1fc10331c708cd9e # v0.9.5
-        with:
-          pixi-version: latest
-          cache: true
-          cache-write: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-          environments: ${{ matrix.pixi-environment }}
-
-      - name: Generate pyproject configs
-        if: steps.should_run.outputs.run == 'true'
-        run: pixi run -e ${{ matrix.pixi-environment }} generate_pyproject
-
-      - name: Clean distribution artifacts
-        if: steps.should_run.outputs.run == 'true'
-        run: pixi run -e ${{ matrix.pixi-environment }} wheel_clean
-
-      - name: Build wheel
-        if: steps.should_run.outputs.run == 'true'
-        run: pixi run -e ${{ matrix.pixi-environment }} wheel_build
-        env:
-          PYMOMENTUM_VARIANT: ${{ matrix.package-variant }}
-          # Enable compiler caching: ccache on macOS, sccache on Windows
-          CMAKE_C_COMPILER_LAUNCHER: ${{ runner.os == 'Windows' && 'sccache' || 'ccache' }}
-          CMAKE_CXX_COMPILER_LAUNCHER: ${{ runner.os == 'Windows' && 'sccache' || 'ccache' }}
-
-      # Repair wheel on macOS/Windows to bundle non-Python shared libraries
-      - name: Repair wheel (macOS/Windows)
-        if: steps.should_run.outputs.run == 'true' && runner.os != 'Linux'
-        run: pixi run -e ${{ matrix.pixi-environment }} wheel_repair
-        env:
-          PYMOMENTUM_VARIANT: ${{ matrix.package-variant }}
-
-      - name: Print ccache stats (macOS)
-        if: steps.should_run.outputs.run == 'true' && runner.os == 'macOS'
-        run: ccache -s
-
-      - name: Print sccache stats (Windows)
-        if: steps.should_run.outputs.run == 'true' && runner.os == 'Windows'
-        run: sccache --show-stats
-
-      - name: Upload wheel artifacts
-        if: steps.should_run.outputs.run == 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: wheels-${{ matrix.package-variant }}-${{ matrix.os }}-py${{ matrix.python-version }}
-          path: dist/*.whl
-          retention-days: 7
-
-  # GPU wheels for Windows (linked against CUDA-enabled PyTorch)
-  # GPU only means linking against CUDA PyTorch; the C++ code itself doesn't use CUDA directly
-  build_gpu_wheels:
-    name: pypi-gpu-py${{ matrix.python-version }}-${{ matrix.os-short }}
-    runs-on: ${{ matrix.os }}
-    # Force UTF-8 mode on Windows to prevent UnicodeDecodeError in pip resolver
-    env:
-      PYTHONUTF8: "1"
-      PYTHONIOENCODING: "utf-8"
-      SCCACHE_CACHE_SIZE: "2G"
-      SCCACHE_DIR: ${{ github.workspace }}/.sccache
-    strategy:
-      fail-fast: true
-      matrix:
-        os: [windows-latest]
-        python-version: ['3.12', '3.13']
-        include:
-          - python-version: '3.12'
-            pixi-environment: py312
-          - python-version: '3.13'
-            pixi-environment: py313
-          - os: windows-latest
-            os-short: win64
-    steps:
-      # Skip Python 3.13 builds on regular commits to reduce CI cost
-      - name: Check if should run
-        id: should_run
-        run: |
-          $run = "${{ matrix.python-version }}" -ne "3.13" -or `
-            "${{ startsWith(github.ref, 'refs/tags/v') }}" -eq "true" -or `
-            "${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.publish == 'true' || github.event.inputs.force_all_builds == 'true') }}" -eq "true"
-          "run=$($run.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-        shell: pwsh
-
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: steps.should_run.outputs.run == 'true'
-        with:
-          submodules: recursive
-          fetch-depth: 0
-          fetch-tags: true
-
-      - name: Set up Windows compiler cache
-        if: steps.should_run.outputs.run == 'true' && runner.os == 'Windows'
-        uses: ./.github/actions/setup-windows-sccache
-        with:
-          cache-key: ${{ github.workflow }}-${{ matrix.os }}-sccache-gpu-py${{ matrix.python-version }}-${{ hashFiles('pixi.lock', 'pyproject-pypi.toml.j2', 'CMakeLists.txt', 'cmake/**', 'momentum/**', 'pymomentum/**', 'axel/**') }}
-          restore-keys: |
-            ${{ github.workflow }}-${{ matrix.os }}-sccache-gpu-py${{ matrix.python-version }}-
-            ${{ github.workflow }}-${{ matrix.os }}-sccache-gpu-
-            ${{ github.workflow }}-${{ matrix.os }}-sccache-
-
-      - name: Setup CUDA
-        if: steps.should_run.outputs.run == 'true' && runner.os == 'Windows'
-        uses: ./.github/actions/setup-cuda
-        with:
-          cuda-version: "12.9.0"
-
-      - name: Set up pixi
-        if: steps.should_run.outputs.run == 'true'
-        uses: prefix-dev/setup-pixi@d3f436a425481402e6a95a1d1fc10331c708cd9e # v0.9.5
-        with:
-          pixi-version: latest
-          cache: true
-          cache-write: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-          environments: ${{ matrix.pixi-environment }}
-
-      - name: Clean distribution artifacts
-        if: steps.should_run.outputs.run == 'true'
-        run: pixi run -e ${{ matrix.pixi-environment }} wheel_clean
-
-      # Build GPU wheel using variant-aware pixi task
-      - name: Build GPU wheel
-        if: steps.should_run.outputs.run == 'true'
-        run: pixi run -e ${{ matrix.pixi-environment }} wheel_build
-        env:
-          PYMOMENTUM_VARIANT: gpu
-          CMAKE_C_COMPILER_LAUNCHER: sccache
-          CMAKE_CXX_COMPILER_LAUNCHER: sccache
-
-      # Repair GPU wheel on Windows using variant-aware pixi task
-      - name: Repair wheel (Windows)
-        if: steps.should_run.outputs.run == 'true' && runner.os == 'Windows'
-        run: pixi run -e ${{ matrix.pixi-environment }} wheel_repair
-        env:
-          PYMOMENTUM_VARIANT: gpu
-
-      - name: Verify GPU wheel name
-        if: steps.should_run.outputs.run == 'true'
-        run: |
-          $wheels = Get-ChildItem -Path dist -Filter "*.whl" -File
-          Write-Host "Built wheels:"
-          $wheels | ForEach-Object { Write-Host $_.FullName }
-          if (-not ($wheels | Where-Object { $_.Name -like "pymomentum_gpu-*.whl" })) {
-            Write-Error "No pymomentum_gpu wheel found. Check PYMOMENTUM_VARIANT and pyproject.toml."
-            exit 1
-          }
-          if ($wheels | Where-Object { $_.Name -like "pymomentum_core-*.whl" -or $_.Name -like "pymomentum_cpu-*.whl" -or $_.Name -like "pymomentum-*.whl" }) {
-            Write-Error "Non-GPU wheel found in GPU build. The build used wrong pyproject.toml."
-            exit 1
-          }
-        shell: pwsh
-
-      - name: Print sccache stats (Windows)
-        if: steps.should_run.outputs.run == 'true' && runner.os == 'Windows'
-        run: sccache --show-stats
-
-      - name: Upload wheel artifacts
-        if: steps.should_run.outputs.run == 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: wheels-gpu-${{ matrix.os }}-py${{ matrix.python-version }}
-          path: dist/*.whl
-          retention-days: 7
-
-  # Linux GPU wheels are built with cibuildwheel (for manylinux_2_28 compatibility)
-  # Same approach as build_core_and_cpu_wheels_linux but with PYMOMENTUM_VARIANT=gpu
-  build_gpu_wheels_linux:
-    name: pypi-gpu-linux (cibuildwheel)
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          submodules: recursive
-          fetch-depth: 0  # Fetch full history for setuptools_scm version detection
-          fetch-tags: true  # Ensure all tags are fetched
-
-      - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: "3.12"
-
-      - name: Install Jinja2
-        run: pip install jinja2
-
-      - name: Generate pyproject.toml
-        run: |
-          python scripts/generate_pyproject.py
-          # Use GPU py312 as the default pyproject for cibuildwheel setup. The
-          # generated metadata uses the full supported Python range so cp313 is
-          # not skipped before the before-build hook swaps the per-build file.
-          cp pyproject-pypi-gpu-py312.toml pyproject.toml
-
-      - name: Prepare ccache mount (Linux)
-        run: mkdir -p .ccache
-
-      - name: Cache ccache (Linux)
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: .ccache
-          key: ${{ github.workflow }}-linux-gpu-${{ hashFiles('pixi.lock', 'pyproject-pypi.toml.j2', 'CMakeLists.txt', 'cmake/**', 'momentum/**', 'pymomentum/**', 'axel/**') }}
-          restore-keys: |
-            ${{ github.workflow }}-linux-gpu-
-            ${{ github.workflow }}-linux-
-
-      - name: Build wheels
-        uses: pypa/cibuildwheel@1828c10ab37f080699c7b81cea34097c684a7074 # v3.4.2.0
-        env:
-          PYMOMENTUM_VARIANT: gpu
-          CIBW_BUILD: ${{ (startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && (github.event.inputs.publish == 'true' || github.event.inputs.force_all_builds == 'true'))) && 'cp312-* cp313-*' || 'cp312-*' }}
-          CIBW_CONTAINER_ENGINE: "docker; create_args: --volume=${{ github.workspace }}/.ccache:/ccache"
-
-      - name: Finalize ccache mount (Linux)
-        run: |
-          if [ ! -d .ccache ] || [ -z "$(ls -A .ccache 2>/dev/null)" ]; then
-            echo "::warning::.ccache was not populated by cibuildwheel; no Linux compiler cache will be saved"
-            exit 0
-          fi
-          # cibuildwheel's manylinux container runs as root, so make the cache
-          # readable by the post-job actions/cache save step on the host.
-          sudo chown -R "$(id -u):$(id -g)" .ccache
-          du -sh .ccache
-
-      - name: Verify GPU wheel names
-        run: |
-          echo "Built wheels:"
-          ls -lh ./wheelhouse/*.whl
-          if ls ./wheelhouse/pymomentum_gpu-*.whl 1>/dev/null 2>&1; then
-            echo "✓ GPU wheel(s) found with correct package name"
-          else
-            echo "✗ ERROR: No pymomentum_gpu wheel found!"
-            ls -la ./wheelhouse/
-            exit 1
-          fi
-          if ls ./wheelhouse/pymomentum_core-*.whl 1>/dev/null 2>&1 || ls ./wheelhouse/pymomentum_cpu-*.whl 1>/dev/null 2>&1 || ls ./wheelhouse/pymomentum-*.whl 1>/dev/null 2>&1; then
-            echo "✗ ERROR: Non-GPU wheel found in GPU build!"
-            exit 1
-          fi
-
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: wheels-gpu-linux
-          path: ./wheelhouse/*.whl
-
-  # Regression test: Verify pip wheels work correctly (import test, parallel operations)
-  # Tests all build variants with same skip logic as builds (py3.13 only on tags/releases)
-  test_pip_wheels:
-    name: Test pip wheel - ${{ matrix.variant }}-py${{ matrix.python-version }}-${{ matrix.os-short }}
-    needs: [build_core_and_cpu_wheels_linux, build_core_and_cpu_wheels, build_gpu_wheels, build_gpu_wheels_linux]
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # Linux core - always test py3.12
-          - os: ubuntu-latest
-            os-short: linux
-            variant: core
-            python-version: '3.12'
-            pixi-environment: py312
-            artifact-pattern: wheels-core-linux
-            wheel-type: core
-          # Linux core - py3.13 only on tags/releases
-          - os: ubuntu-latest
-            os-short: linux
-            variant: core
-            python-version: '3.13'
-            pixi-environment: py313
-            artifact-pattern: wheels-core-linux
-            wheel-type: core
-          # macOS core - always test py3.12
-          - os: macos-15
-            os-short: mac-arm64
-            variant: core
-            python-version: '3.12'
-            pixi-environment: py312
-            artifact-pattern: wheels-core-macos-15-py3.12
-            wheel-type: core
-          # macOS core - py3.13 only on tags/releases
-          - os: macos-15
-            os-short: mac-arm64
-            variant: core
-            python-version: '3.13'
-            pixi-environment: py313
-            artifact-pattern: wheels-core-macos-15-py3.13
-            wheel-type: core
-          # Windows core - always test py3.12
-          - os: windows-latest
-            os-short: win64
-            variant: core
-            python-version: '3.12'
-            pixi-environment: py312
-            artifact-pattern: wheels-core-windows-latest-py3.12
-            wheel-type: core
-          # Windows core - py3.13 only on tags/releases
-          - os: windows-latest
-            os-short: win64
-            variant: core
-            python-version: '3.13'
-            pixi-environment: py313
-            artifact-pattern: wheels-core-windows-latest-py3.13
-            wheel-type: core
-          # Linux CPU - always test py3.12
-          - os: ubuntu-latest
-            os-short: linux
-            variant: cpu
-            python-version: '3.12'
-            pixi-environment: py312
-            artifact-pattern: wheels-cpu-linux
-            wheel-type: cpu
-          # Linux CPU - py3.13 only on tags/releases
-          - os: ubuntu-latest
-            os-short: linux
-            variant: cpu
-            python-version: '3.13'
-            pixi-environment: py313
-            artifact-pattern: wheels-cpu-linux
-            wheel-type: cpu
-          # macOS CPU - always test py3.12
-          - os: macos-15
-            os-short: mac-arm64
-            variant: cpu
-            python-version: '3.12'
-            pixi-environment: py312
-            artifact-pattern: wheels-cpu-macos-15-py3.12
-            wheel-type: cpu
-          # macOS CPU - py3.13 only on tags/releases
-          - os: macos-15
-            os-short: mac-arm64
-            variant: cpu
-            python-version: '3.13'
-            pixi-environment: py313
-            artifact-pattern: wheels-cpu-macos-15-py3.13
-            wheel-type: cpu
-          # Windows CPU - always test py3.12
-          - os: windows-latest
-            os-short: win64
-            variant: cpu
-            python-version: '3.12'
-            pixi-environment: py312
-            artifact-pattern: wheels-cpu-windows-latest-py3.12
-            wheel-type: cpu
-          # Windows CPU - py3.13 only on tags/releases
-          - os: windows-latest
-            os-short: win64
-            variant: cpu
-            python-version: '3.13'
-            pixi-environment: py313
-            artifact-pattern: wheels-cpu-windows-latest-py3.13
-            wheel-type: cpu
-          # Windows GPU - always test py3.12
-          - os: windows-latest
-            os-short: win64
-            variant: gpu
-            python-version: '3.12'
-            pixi-environment: py312
-            artifact-pattern: wheels-gpu-windows-latest-py3.12
-            wheel-type: gpu
-          # Windows GPU - py3.13 only on tags/releases
-          - os: windows-latest
-            os-short: win64
-            variant: gpu
-            python-version: '3.13'
-            pixi-environment: py313
-            artifact-pattern: wheels-gpu-windows-latest-py3.13
-            wheel-type: gpu
-          # Linux GPU - always test py3.12
-          - os: ubuntu-latest
-            os-short: linux
-            variant: gpu
-            python-version: '3.12'
-            pixi-environment: py312
-            artifact-pattern: wheels-gpu-linux
-            wheel-type: gpu
-          # Linux GPU - py3.13 only on tags/releases
-          - os: ubuntu-latest
-            os-short: linux
-            variant: gpu
-            python-version: '3.13'
-            pixi-environment: py313
-            artifact-pattern: wheels-gpu-linux
-            wheel-type: gpu
-
-    steps:
-      # Skip py3.13 tests on regular commits (same logic as builds)
-      - name: Check if should run
-        id: should_run
-        run: |
-          $run = "${{ matrix.python-version }}" -ne "3.13" -or `
-            "${{ startsWith(github.ref, 'refs/tags/v') }}" -eq "true" -or `
-            "${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.publish == 'true' || github.event.inputs.force_all_builds == 'true') }}" -eq "true"
-          "run=$($run.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-        shell: pwsh
-
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: steps.should_run.outputs.run == 'true'
-        with:
-          submodules: recursive
-
-      - name: Set up pixi
-        if: steps.should_run.outputs.run == 'true'
-        uses: prefix-dev/setup-pixi@d3f436a425481402e6a95a1d1fc10331c708cd9e # v0.9.5
-        with:
-          pixi-version: latest
-          cache: true
-          cache-write: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-          environments: ${{ matrix.pixi-environment }}
-
-      - name: Download wheel artifacts
-        if: steps.should_run.outputs.run == 'true'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          path: dist
-          pattern: ${{ matrix.artifact-pattern }}
-          merge-multiple: true
-
-      - name: List downloaded wheels
-        if: steps.should_run.outputs.run == 'true'
-        run: pixi run -e ${{ matrix.pixi-environment }} python -c "from pathlib import Path; [print(path) for path in sorted(Path('dist').glob('*'))]"
-
-      # Run test_wheel.py directly to test pre-built wheel artifacts
-      # We don't use `pixi run wheel_test` because it has a depends-on: wheel_build
-      # which would rebuild the wheel instead of testing the downloaded artifact
-      - name: Test wheel with uv
-        if: steps.should_run.outputs.run == 'true'
-        env:
-          WHEEL_TEST_PYTHON_VERSION: cp${{ matrix.python-version == '3.12' && '312' || '313' }}
-          WHEEL_TEST_TYPE: ${{ matrix.wheel-type }}
-        run: pixi run -e ${{ matrix.pixi-environment }} python scripts/test_wheel.py
-
-  # GPU smoke tests require a runner with a visible CUDA device and a driver
-  # new enough for the CUDA PyTorch build. Windows GPU wheels are still covered
-  # by the regular install/import tests above; the strict CUDA execution test is
-  # Linux-only because the available Windows GPU runner driver is too old for
-  # cu129.
-  test_gpu_wheels_with_cuda:
-    name: Test GPU wheel with CUDA - py${{ matrix.python-version }}-${{ matrix.os-short }}
-    needs: [build_gpu_wheels_linux]
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: 4-core-ubuntu-gpu-t4
-            os-short: linux-gpu
-            python-version: '3.12'
-            artifact-pattern: wheels-gpu-linux
-            require-triton: "true"
-          - os: 4-core-ubuntu-gpu-t4
-            os-short: linux-gpu
-            python-version: '3.13'
-            artifact-pattern: wheels-gpu-linux
-            require-triton: "true"
-
-    steps:
-      - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: ${{ matrix.python-version }}
-
-      # Skip Python 3.13 tests on regular commits (same logic as builds).
-      - name: Check if should run
-        id: should_run
-        env:
-          MATRIX_PYTHON_VERSION: ${{ matrix.python-version }}
-          RUN_PY313: ${{ startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && (github.event.inputs.publish == 'true' || github.event.inputs.force_all_builds == 'true')) }}
-        run: python -c "import os; run = os.environ['MATRIX_PYTHON_VERSION'] != '3.13' or os.environ['RUN_PY313'] == 'true'; print('run=' + str(run).lower(), file=open(os.environ['GITHUB_OUTPUT'], 'a'))"
-
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: steps.should_run.outputs.run == 'true'
-
-      - name: Download wheel artifacts
-        if: steps.should_run.outputs.run == 'true'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          path: dist
-          pattern: ${{ matrix.artifact-pattern }}
-          merge-multiple: true
-
-      - name: List downloaded wheels
-        if: steps.should_run.outputs.run == 'true'
-        run: python -c "from pathlib import Path; [print(path) for path in sorted(Path('dist').glob('*'))]"
-
-      - name: Test GPU wheel with CUDA
-        if: steps.should_run.outputs.run == 'true'
-        env:
-          WHEEL_TEST_PYTHON_VERSION: cp${{ matrix.python-version == '3.12' && '312' || '313' }}
-          WHEEL_TEST_TYPE: gpu
-          WHEEL_TEST_REQUIRE_CUDA: "1"
-          WHEEL_TEST_REQUIRE_TRITON: ${{ matrix.require-triton }}
-          WHEEL_TEST_FORCE_LOCAL: "1"
-        run: python scripts/test_wheel.py
-
-  # PyPI/TestPyPI trusted publishing must be configured for each environment
-  # name below before a release can publish these split distributions.
-  publish_core:
-    name: Publish pymomentum-core to PyPI
-    needs: [build_core_and_cpu_wheels_linux, build_core_and_cpu_wheels, test_pip_wheels]
-    runs-on: ubuntu-latest
-    environment:
-      name: pypi-core
-      url: https://pypi.org/p/pymomentum-core
-    permissions:
-      id-token: write  # IMPORTANT: mandatory for trusted publishing
-    # Only publish on tag push or manual workflow dispatch with publish=true
-    if: |
-      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
-      (github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true')
-
-    steps:
-      - name: Download core wheel artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          path: dist
-          pattern: wheels-core-*
-          merge-multiple: true
-
-      - name: List core distributions
-        run: ls -lh dist/
-
-      - name: Publish core to TestPyPI
-        if: |
-          github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true' && github.event.inputs.test_pypi == 'true'
-        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
-        with:
-          repository-url: https://test.pypi.org/legacy/
-
-      - name: Publish core to PyPI
-        if: |
-          (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
-          (github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true' && github.event.inputs.test_pypi != 'true')
-        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
-
-  publish_cpu:
-    name: Publish pymomentum-cpu to PyPI
-    needs: [build_core_and_cpu_wheels_linux, build_core_and_cpu_wheels, test_pip_wheels]
-    runs-on: ubuntu-latest
-    environment:
-      name: pypi-cpu
-      url: https://pypi.org/p/pymomentum-cpu
-    permissions:
-      id-token: write  # IMPORTANT: mandatory for trusted publishing
-    # Only publish on tag push or manual workflow dispatch with publish=true
-    if: |
-      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
-      (github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true')
-
-    steps:
-      - name: Download CPU wheel artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          path: dist
-          pattern: wheels-cpu-*
-          merge-multiple: true
-
-      - name: List CPU distributions
-        run: ls -lh dist/
-
-      - name: Publish CPU to TestPyPI
-        if: |
-          github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true' && github.event.inputs.test_pypi == 'true'
-        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
-        with:
-          repository-url: https://test.pypi.org/legacy/
-
-      - name: Publish CPU to PyPI
-        if: |
-          (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
-          (github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true' && github.event.inputs.test_pypi != 'true')
-        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
-
-  publish_gpu:
-    name: Publish pymomentum-gpu to PyPI
-    needs: [build_gpu_wheels, build_gpu_wheels_linux, test_pip_wheels, test_gpu_wheels_with_cuda]
-    runs-on: ubuntu-latest
-    environment:
-      name: pypi-gpu
-      url: https://pypi.org/p/pymomentum-gpu
-    permissions:
-      id-token: write  # IMPORTANT: mandatory for trusted publishing
-    # Only publish on tag push or manual workflow dispatch with publish=true
-    if: |
-      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
-      (github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true')
-
-    steps:
-      - name: Download GPU wheel artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          path: dist
-          pattern: wheels-gpu-*
-          merge-multiple: true
-
-      - name: List GPU distributions
-        run: ls -lh dist/
-
-      - name: Publish GPU to TestPyPI
-        if: |
-          github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true' && github.event.inputs.test_pypi == 'true'
-        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
-        with:
-          repository-url: https://test.pypi.org/legacy/
-
-      - name: Publish GPU to PyPI
-        if: |
-          (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
-          (github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true' && github.event.inputs.test_pypi != 'true')
-        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+# # (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
+# #
+
+# name: PyPI Wheels
+
+# on:
+#   # Build wheels on pushes to main and version tags
+#   push:
+#     branches:
+#       - main
+#     paths-ignore:
+#       - "**/website/**"
+#     tags:
+#       - 'v*'
+
+#   # Allow manual trigger for testing builds or publishing
+#   workflow_dispatch:
+#     inputs:
+#       publish:
+#         description: 'Publish to PyPI (otherwise just build and test)'
+#         required: false
+#         type: boolean
+#         default: false
+#       test_pypi:
+#         description: 'Publish to TestPyPI instead of PyPI (for testing)'
+#         required: false
+#         type: boolean
+#         default: false
+#       force_all_builds:
+#         description: 'Force all builds including py3.13 (simulates tag push behavior)'
+#         required: false
+#         type: boolean
+#         default: false
+
+# concurrency:
+#   group: ${{ github.workflow }}-${{ github.ref }}
+#   cancel-in-progress: true
+
+# permissions:
+#   contents: read
+
+# jobs:
+#   # Linux core and CPU wheels are built with cibuildwheel (for manylinux_2_28 compatibility)
+#   build_core_and_cpu_wheels_linux:
+#     name: pypi-${{ matrix.package-variant }}-linux (cibuildwheel)
+#     runs-on: ubuntu-latest
+#     strategy:
+#       fail-fast: true
+#       matrix:
+#         package-variant: [core, cpu]
+
+#     steps:
+#       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+#         with:
+#           submodules: recursive
+#           fetch-depth: 0  # Fetch full history for setuptools_scm version detection
+#           fetch-tags: true  # Ensure all tags are fetched
+
+#       - name: Set up Python
+#         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+#         with:
+#           python-version: "3.12"
+
+#       - name: Install Jinja2
+#         run: pip install jinja2
+
+#       - name: Generate pyproject.toml
+#         run: |
+#           python scripts/generate_pyproject.py
+#           # Set a default pyproject.toml for the initial cibuildwheel setup.
+#           # The generated pyproject uses the full supported Python range so
+#           # cibuildwheel does not skip cp313 before the per-build pyproject is
+#           # swapped in by the before-build hook.
+#           cp pyproject-pypi-${{ matrix.package-variant }}-py312.toml pyproject.toml
+
+#       - name: Prepare ccache mount (Linux)
+#         run: mkdir -p .ccache
+
+#       - name: Cache ccache (Linux)
+#         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+#         with:
+#           path: .ccache
+#           key: ${{ github.workflow }}-linux-${{ matrix.package-variant }}-${{ hashFiles('pixi.lock', 'pyproject-pypi.toml.j2', 'CMakeLists.txt', 'cmake/**', 'momentum/**', 'pymomentum/**', 'axel/**') }}
+#           restore-keys: |
+#             ${{ github.workflow }}-linux-${{ matrix.package-variant }}-
+#             ${{ github.workflow }}-linux-
+
+#       - name: Build wheels
+#         uses: pypa/cibuildwheel@1828c10ab37f080699c7b81cea34097c684a7074 # v3.4.2.0
+#         env:
+#           PYMOMENTUM_VARIANT: ${{ matrix.package-variant }}
+#           CIBW_BUILD: ${{ (startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && (github.event.inputs.publish == 'true' || github.event.inputs.force_all_builds == 'true'))) && 'cp312-* cp313-*' || 'cp312-*' }}
+#           CIBW_CONTAINER_ENGINE: "docker; create_args: --volume=${{ github.workspace }}/.ccache:/ccache"
+
+#       - name: Finalize ccache mount (Linux)
+#         run: |
+#           if [ ! -d .ccache ] || [ -z "$(ls -A .ccache 2>/dev/null)" ]; then
+#             echo "::warning::.ccache was not populated by cibuildwheel; no Linux compiler cache will be saved"
+#             exit 0
+#           fi
+#           # cibuildwheel's manylinux container runs as root, so make the cache
+#           # readable by the post-job actions/cache save step on the host.
+#           sudo chown -R "$(id -u):$(id -g)" .ccache
+#           du -sh .ccache
+
+#       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+#         with:
+#           name: wheels-${{ matrix.package-variant }}-linux
+#           path: ./wheelhouse/*.whl
+
+#   # Core and CPU wheels are built with pixi (non-Linux platforms)
+#   # Linux wheels are handled by build_core_and_cpu_wheels_linux above using cibuildwheel
+#   build_core_and_cpu_wheels:
+#     name: pypi-${{ matrix.package-variant }}-py${{ matrix.python-version }}-${{ matrix.os-short }}
+#     runs-on: ${{ matrix.os }}
+#     # Force UTF-8 mode on Windows to prevent UnicodeDecodeError in pip resolver
+#     env:
+#       PYTHONUTF8: "1"
+#       PYTHONIOENCODING: "utf-8"
+#       SCCACHE_CACHE_SIZE: "2G"
+#       SCCACHE_DIR: ${{ github.workspace }}/.sccache
+#     strategy:
+#       fail-fast: true
+#       matrix:
+#         os: [macos-15, windows-latest]
+#         python-version: ['3.12', '3.13']
+#         package-variant: [core, cpu]
+#         include:
+#           - python-version: '3.12'
+#             pixi-environment: py312
+#           - python-version: '3.13'
+#             pixi-environment: py313
+#           - os: macos-15
+#             os-short: mac-arm64
+#           - os: windows-latest
+#             os-short: win64
+#     steps:
+#       # Skip Python 3.13 builds on regular commits to reduce CI cost
+#       # Python 3.13 builds will still run when publishing (tags or manual workflow_dispatch with publish=true)
+#       - name: Check if should run
+#         id: should_run
+#         run: |
+#           $run = "${{ matrix.python-version }}" -ne "3.13" -or `
+#             "${{ startsWith(github.ref, 'refs/tags/v') }}" -eq "true" -or `
+#             "${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.publish == 'true' || github.event.inputs.force_all_builds == 'true') }}" -eq "true"
+#           "run=$($run.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+#         shell: pwsh
+
+#       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+#         if: steps.should_run.outputs.run == 'true'
+#         with:
+#           submodules: recursive
+#           fetch-depth: 0  # Fetch full history for setuptools_scm version detection
+#           fetch-tags: true  # Ensure all tags are fetched
+
+#       - name: Set up Windows compiler cache
+#         if: steps.should_run.outputs.run == 'true' && runner.os == 'Windows'
+#         uses: ./.github/actions/setup-windows-sccache
+#         with:
+#           cache-key: ${{ github.workflow }}-${{ matrix.os }}-sccache-${{ matrix.package-variant }}-py${{ matrix.python-version }}-${{ hashFiles('pixi.lock', 'pyproject-pypi.toml.j2', 'CMakeLists.txt', 'cmake/**', 'momentum/**', 'pymomentum/**', 'axel/**') }}
+#           restore-keys: |
+#             ${{ github.workflow }}-${{ matrix.os }}-sccache-${{ matrix.package-variant }}-py${{ matrix.python-version }}-
+#             ${{ github.workflow }}-${{ matrix.os }}-sccache-${{ matrix.package-variant }}-
+#             ${{ github.workflow }}-${{ matrix.os }}-sccache-
+
+#       # ccache for macOS
+#       - name: Set up ccache (macOS)
+#         if: steps.should_run.outputs.run == 'true' && runner.os == 'macOS'
+#         uses: hendrikmuhs/ccache-action@f09c25b45002a07be2955cbe52e8cee55643f89d # v1.2.24
+#         with:
+#           key: ${{ github.workflow }}-${{ matrix.package-variant }}-${{ matrix.os }}-py${{ matrix.python-version }}
+#           # ccache-action appends a timestamp when saving; restore keys are the timestamp-free prefixes.
+#           restore-keys: |
+#             ${{ github.workflow }}-${{ matrix.package-variant }}-${{ matrix.os }}-py${{ matrix.python-version }}
+#           max-size: 2G
+
+#       - name: Set up pixi
+#         if: steps.should_run.outputs.run == 'true'
+#         uses: prefix-dev/setup-pixi@d3f436a425481402e6a95a1d1fc10331c708cd9e # v0.9.5
+#         with:
+#           pixi-version: latest
+#           cache: true
+#           cache-write: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+#           environments: ${{ matrix.pixi-environment }}
+
+#       - name: Generate pyproject configs
+#         if: steps.should_run.outputs.run == 'true'
+#         run: pixi run -e ${{ matrix.pixi-environment }} generate_pyproject
+
+#       - name: Clean distribution artifacts
+#         if: steps.should_run.outputs.run == 'true'
+#         run: pixi run -e ${{ matrix.pixi-environment }} wheel_clean
+
+#       - name: Build wheel
+#         if: steps.should_run.outputs.run == 'true'
+#         run: pixi run -e ${{ matrix.pixi-environment }} wheel_build
+#         env:
+#           PYMOMENTUM_VARIANT: ${{ matrix.package-variant }}
+#           # Enable compiler caching: ccache on macOS, sccache on Windows
+#           CMAKE_C_COMPILER_LAUNCHER: ${{ runner.os == 'Windows' && 'sccache' || 'ccache' }}
+#           CMAKE_CXX_COMPILER_LAUNCHER: ${{ runner.os == 'Windows' && 'sccache' || 'ccache' }}
+
+#       # Repair wheel on macOS/Windows to bundle non-Python shared libraries
+#       - name: Repair wheel (macOS/Windows)
+#         if: steps.should_run.outputs.run == 'true' && runner.os != 'Linux'
+#         run: pixi run -e ${{ matrix.pixi-environment }} wheel_repair
+#         env:
+#           PYMOMENTUM_VARIANT: ${{ matrix.package-variant }}
+
+#       - name: Print ccache stats (macOS)
+#         if: steps.should_run.outputs.run == 'true' && runner.os == 'macOS'
+#         run: ccache -s
+
+#       - name: Print sccache stats (Windows)
+#         if: steps.should_run.outputs.run == 'true' && runner.os == 'Windows'
+#         run: sccache --show-stats
+
+#       - name: Upload wheel artifacts
+#         if: steps.should_run.outputs.run == 'true'
+#         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+#         with:
+#           name: wheels-${{ matrix.package-variant }}-${{ matrix.os }}-py${{ matrix.python-version }}
+#           path: dist/*.whl
+#           retention-days: 7
+
+#   # GPU wheels for Windows (linked against CUDA-enabled PyTorch)
+#   # GPU only means linking against CUDA PyTorch; the C++ code itself doesn't use CUDA directly
+#   build_gpu_wheels:
+#     name: pypi-gpu-py${{ matrix.python-version }}-${{ matrix.os-short }}
+#     runs-on: ${{ matrix.os }}
+#     # Force UTF-8 mode on Windows to prevent UnicodeDecodeError in pip resolver
+#     env:
+#       PYTHONUTF8: "1"
+#       PYTHONIOENCODING: "utf-8"
+#       SCCACHE_CACHE_SIZE: "2G"
+#       SCCACHE_DIR: ${{ github.workspace }}/.sccache
+#     strategy:
+#       fail-fast: true
+#       matrix:
+#         os: [windows-latest]
+#         python-version: ['3.12', '3.13']
+#         include:
+#           - python-version: '3.12'
+#             pixi-environment: py312
+#           - python-version: '3.13'
+#             pixi-environment: py313
+#           - os: windows-latest
+#             os-short: win64
+#     steps:
+#       # Skip Python 3.13 builds on regular commits to reduce CI cost
+#       - name: Check if should run
+#         id: should_run
+#         run: |
+#           $run = "${{ matrix.python-version }}" -ne "3.13" -or `
+#             "${{ startsWith(github.ref, 'refs/tags/v') }}" -eq "true" -or `
+#             "${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.publish == 'true' || github.event.inputs.force_all_builds == 'true') }}" -eq "true"
+#           "run=$($run.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+#         shell: pwsh
+
+#       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+#         if: steps.should_run.outputs.run == 'true'
+#         with:
+#           submodules: recursive
+#           fetch-depth: 0
+#           fetch-tags: true
+
+#       - name: Set up Windows compiler cache
+#         if: steps.should_run.outputs.run == 'true' && runner.os == 'Windows'
+#         uses: ./.github/actions/setup-windows-sccache
+#         with:
+#           cache-key: ${{ github.workflow }}-${{ matrix.os }}-sccache-gpu-py${{ matrix.python-version }}-${{ hashFiles('pixi.lock', 'pyproject-pypi.toml.j2', 'CMakeLists.txt', 'cmake/**', 'momentum/**', 'pymomentum/**', 'axel/**') }}
+#           restore-keys: |
+#             ${{ github.workflow }}-${{ matrix.os }}-sccache-gpu-py${{ matrix.python-version }}-
+#             ${{ github.workflow }}-${{ matrix.os }}-sccache-gpu-
+#             ${{ github.workflow }}-${{ matrix.os }}-sccache-
+
+#       - name: Setup CUDA
+#         if: steps.should_run.outputs.run == 'true' && runner.os == 'Windows'
+#         uses: ./.github/actions/setup-cuda
+#         with:
+#           cuda-version: "12.9.0"
+
+#       - name: Set up pixi
+#         if: steps.should_run.outputs.run == 'true'
+#         uses: prefix-dev/setup-pixi@d3f436a425481402e6a95a1d1fc10331c708cd9e # v0.9.5
+#         with:
+#           pixi-version: latest
+#           cache: true
+#           cache-write: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+#           environments: ${{ matrix.pixi-environment }}
+
+#       - name: Clean distribution artifacts
+#         if: steps.should_run.outputs.run == 'true'
+#         run: pixi run -e ${{ matrix.pixi-environment }} wheel_clean
+
+#       # Build GPU wheel using variant-aware pixi task
+#       - name: Build GPU wheel
+#         if: steps.should_run.outputs.run == 'true'
+#         run: pixi run -e ${{ matrix.pixi-environment }} wheel_build
+#         env:
+#           PYMOMENTUM_VARIANT: gpu
+#           CMAKE_C_COMPILER_LAUNCHER: sccache
+#           CMAKE_CXX_COMPILER_LAUNCHER: sccache
+
+#       # Repair GPU wheel on Windows using variant-aware pixi task
+#       - name: Repair wheel (Windows)
+#         if: steps.should_run.outputs.run == 'true' && runner.os == 'Windows'
+#         run: pixi run -e ${{ matrix.pixi-environment }} wheel_repair
+#         env:
+#           PYMOMENTUM_VARIANT: gpu
+
+#       - name: Verify GPU wheel name
+#         if: steps.should_run.outputs.run == 'true'
+#         run: |
+#           $wheels = Get-ChildItem -Path dist -Filter "*.whl" -File
+#           Write-Host "Built wheels:"
+#           $wheels | ForEach-Object { Write-Host $_.FullName }
+#           if (-not ($wheels | Where-Object { $_.Name -like "pymomentum_gpu-*.whl" })) {
+#             Write-Error "No pymomentum_gpu wheel found. Check PYMOMENTUM_VARIANT and pyproject.toml."
+#             exit 1
+#           }
+#           if ($wheels | Where-Object { $_.Name -like "pymomentum_core-*.whl" -or $_.Name -like "pymomentum_cpu-*.whl" -or $_.Name -like "pymomentum-*.whl" }) {
+#             Write-Error "Non-GPU wheel found in GPU build. The build used wrong pyproject.toml."
+#             exit 1
+#           }
+#         shell: pwsh
+
+#       - name: Print sccache stats (Windows)
+#         if: steps.should_run.outputs.run == 'true' && runner.os == 'Windows'
+#         run: sccache --show-stats
+
+#       - name: Upload wheel artifacts
+#         if: steps.should_run.outputs.run == 'true'
+#         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+#         with:
+#           name: wheels-gpu-${{ matrix.os }}-py${{ matrix.python-version }}
+#           path: dist/*.whl
+#           retention-days: 7
+
+#   # Linux GPU wheels are built with cibuildwheel (for manylinux_2_28 compatibility)
+#   # Same approach as build_core_and_cpu_wheels_linux but with PYMOMENTUM_VARIANT=gpu
+#   build_gpu_wheels_linux:
+#     name: pypi-gpu-linux (cibuildwheel)
+#     runs-on: ubuntu-latest
+
+#     steps:
+#       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+#         with:
+#           submodules: recursive
+#           fetch-depth: 0  # Fetch full history for setuptools_scm version detection
+#           fetch-tags: true  # Ensure all tags are fetched
+
+#       - name: Set up Python
+#         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+#         with:
+#           python-version: "3.12"
+
+#       - name: Install Jinja2
+#         run: pip install jinja2
+
+#       - name: Generate pyproject.toml
+#         run: |
+#           python scripts/generate_pyproject.py
+#           # Use GPU py312 as the default pyproject for cibuildwheel setup. The
+#           # generated metadata uses the full supported Python range so cp313 is
+#           # not skipped before the before-build hook swaps the per-build file.
+#           cp pyproject-pypi-gpu-py312.toml pyproject.toml
+
+#       - name: Prepare ccache mount (Linux)
+#         run: mkdir -p .ccache
+
+#       - name: Cache ccache (Linux)
+#         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+#         with:
+#           path: .ccache
+#           key: ${{ github.workflow }}-linux-gpu-${{ hashFiles('pixi.lock', 'pyproject-pypi.toml.j2', 'CMakeLists.txt', 'cmake/**', 'momentum/**', 'pymomentum/**', 'axel/**') }}
+#           restore-keys: |
+#             ${{ github.workflow }}-linux-gpu-
+#             ${{ github.workflow }}-linux-
+
+#       - name: Build wheels
+#         uses: pypa/cibuildwheel@1828c10ab37f080699c7b81cea34097c684a7074 # v3.4.2.0
+#         env:
+#           PYMOMENTUM_VARIANT: gpu
+#           CIBW_BUILD: ${{ (startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && (github.event.inputs.publish == 'true' || github.event.inputs.force_all_builds == 'true'))) && 'cp312-* cp313-*' || 'cp312-*' }}
+#           CIBW_CONTAINER_ENGINE: "docker; create_args: --volume=${{ github.workspace }}/.ccache:/ccache"
+
+#       - name: Finalize ccache mount (Linux)
+#         run: |
+#           if [ ! -d .ccache ] || [ -z "$(ls -A .ccache 2>/dev/null)" ]; then
+#             echo "::warning::.ccache was not populated by cibuildwheel; no Linux compiler cache will be saved"
+#             exit 0
+#           fi
+#           # cibuildwheel's manylinux container runs as root, so make the cache
+#           # readable by the post-job actions/cache save step on the host.
+#           sudo chown -R "$(id -u):$(id -g)" .ccache
+#           du -sh .ccache
+
+#       - name: Verify GPU wheel names
+#         run: |
+#           echo "Built wheels:"
+#           ls -lh ./wheelhouse/*.whl
+#           if ls ./wheelhouse/pymomentum_gpu-*.whl 1>/dev/null 2>&1; then
+#             echo "✓ GPU wheel(s) found with correct package name"
+#           else
+#             echo "✗ ERROR: No pymomentum_gpu wheel found!"
+#             ls -la ./wheelhouse/
+#             exit 1
+#           fi
+#           if ls ./wheelhouse/pymomentum_core-*.whl 1>/dev/null 2>&1 || ls ./wheelhouse/pymomentum_cpu-*.whl 1>/dev/null 2>&1 || ls ./wheelhouse/pymomentum-*.whl 1>/dev/null 2>&1; then
+#             echo "✗ ERROR: Non-GPU wheel found in GPU build!"
+#             exit 1
+#           fi
+
+#       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+#         with:
+#           name: wheels-gpu-linux
+#           path: ./wheelhouse/*.whl
+
+#   # Regression test: Verify pip wheels work correctly (import test, parallel operations)
+#   # Tests all build variants with same skip logic as builds (py3.13 only on tags/releases)
+#   test_pip_wheels:
+#     name: Test pip wheel - ${{ matrix.variant }}-py${{ matrix.python-version }}-${{ matrix.os-short }}
+#     needs: [build_core_and_cpu_wheels_linux, build_core_and_cpu_wheels, build_gpu_wheels, build_gpu_wheels_linux]
+#     runs-on: ${{ matrix.os }}
+#     strategy:
+#       fail-fast: false
+#       matrix:
+#         include:
+#           # Linux core - always test py3.12
+#           - os: ubuntu-latest
+#             os-short: linux
+#             variant: core
+#             python-version: '3.12'
+#             pixi-environment: py312
+#             artifact-pattern: wheels-core-linux
+#             wheel-type: core
+#           # Linux core - py3.13 only on tags/releases
+#           - os: ubuntu-latest
+#             os-short: linux
+#             variant: core
+#             python-version: '3.13'
+#             pixi-environment: py313
+#             artifact-pattern: wheels-core-linux
+#             wheel-type: core
+#           # macOS core - always test py3.12
+#           - os: macos-15
+#             os-short: mac-arm64
+#             variant: core
+#             python-version: '3.12'
+#             pixi-environment: py312
+#             artifact-pattern: wheels-core-macos-15-py3.12
+#             wheel-type: core
+#           # macOS core - py3.13 only on tags/releases
+#           - os: macos-15
+#             os-short: mac-arm64
+#             variant: core
+#             python-version: '3.13'
+#             pixi-environment: py313
+#             artifact-pattern: wheels-core-macos-15-py3.13
+#             wheel-type: core
+#           # Windows core - always test py3.12
+#           - os: windows-latest
+#             os-short: win64
+#             variant: core
+#             python-version: '3.12'
+#             pixi-environment: py312
+#             artifact-pattern: wheels-core-windows-latest-py3.12
+#             wheel-type: core
+#           # Windows core - py3.13 only on tags/releases
+#           - os: windows-latest
+#             os-short: win64
+#             variant: core
+#             python-version: '3.13'
+#             pixi-environment: py313
+#             artifact-pattern: wheels-core-windows-latest-py3.13
+#             wheel-type: core
+#           # Linux CPU - always test py3.12
+#           - os: ubuntu-latest
+#             os-short: linux
+#             variant: cpu
+#             python-version: '3.12'
+#             pixi-environment: py312
+#             artifact-pattern: wheels-cpu-linux
+#             wheel-type: cpu
+#           # Linux CPU - py3.13 only on tags/releases
+#           - os: ubuntu-latest
+#             os-short: linux
+#             variant: cpu
+#             python-version: '3.13'
+#             pixi-environment: py313
+#             artifact-pattern: wheels-cpu-linux
+#             wheel-type: cpu
+#           # macOS CPU - always test py3.12
+#           - os: macos-15
+#             os-short: mac-arm64
+#             variant: cpu
+#             python-version: '3.12'
+#             pixi-environment: py312
+#             artifact-pattern: wheels-cpu-macos-15-py3.12
+#             wheel-type: cpu
+#           # macOS CPU - py3.13 only on tags/releases
+#           - os: macos-15
+#             os-short: mac-arm64
+#             variant: cpu
+#             python-version: '3.13'
+#             pixi-environment: py313
+#             artifact-pattern: wheels-cpu-macos-15-py3.13
+#             wheel-type: cpu
+#           # Windows CPU - always test py3.12
+#           - os: windows-latest
+#             os-short: win64
+#             variant: cpu
+#             python-version: '3.12'
+#             pixi-environment: py312
+#             artifact-pattern: wheels-cpu-windows-latest-py3.12
+#             wheel-type: cpu
+#           # Windows CPU - py3.13 only on tags/releases
+#           - os: windows-latest
+#             os-short: win64
+#             variant: cpu
+#             python-version: '3.13'
+#             pixi-environment: py313
+#             artifact-pattern: wheels-cpu-windows-latest-py3.13
+#             wheel-type: cpu
+#           # Windows GPU - always test py3.12
+#           - os: windows-latest
+#             os-short: win64
+#             variant: gpu
+#             python-version: '3.12'
+#             pixi-environment: py312
+#             artifact-pattern: wheels-gpu-windows-latest-py3.12
+#             wheel-type: gpu
+#           # Windows GPU - py3.13 only on tags/releases
+#           - os: windows-latest
+#             os-short: win64
+#             variant: gpu
+#             python-version: '3.13'
+#             pixi-environment: py313
+#             artifact-pattern: wheels-gpu-windows-latest-py3.13
+#             wheel-type: gpu
+#           # Linux GPU - always test py3.12
+#           - os: ubuntu-latest
+#             os-short: linux
+#             variant: gpu
+#             python-version: '3.12'
+#             pixi-environment: py312
+#             artifact-pattern: wheels-gpu-linux
+#             wheel-type: gpu
+#           # Linux GPU - py3.13 only on tags/releases
+#           - os: ubuntu-latest
+#             os-short: linux
+#             variant: gpu
+#             python-version: '3.13'
+#             pixi-environment: py313
+#             artifact-pattern: wheels-gpu-linux
+#             wheel-type: gpu
+
+#     steps:
+#       # Skip py3.13 tests on regular commits (same logic as builds)
+#       - name: Check if should run
+#         id: should_run
+#         run: |
+#           $run = "${{ matrix.python-version }}" -ne "3.13" -or `
+#             "${{ startsWith(github.ref, 'refs/tags/v') }}" -eq "true" -or `
+#             "${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.publish == 'true' || github.event.inputs.force_all_builds == 'true') }}" -eq "true"
+#           "run=$($run.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+#         shell: pwsh
+
+#       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+#         if: steps.should_run.outputs.run == 'true'
+#         with:
+#           submodules: recursive
+
+#       - name: Set up pixi
+#         if: steps.should_run.outputs.run == 'true'
+#         uses: prefix-dev/setup-pixi@d3f436a425481402e6a95a1d1fc10331c708cd9e # v0.9.5
+#         with:
+#           pixi-version: latest
+#           cache: true
+#           cache-write: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+#           environments: ${{ matrix.pixi-environment }}
+
+#       - name: Download wheel artifacts
+#         if: steps.should_run.outputs.run == 'true'
+#         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+#         with:
+#           path: dist
+#           pattern: ${{ matrix.artifact-pattern }}
+#           merge-multiple: true
+
+#       - name: List downloaded wheels
+#         if: steps.should_run.outputs.run == 'true'
+#         run: pixi run -e ${{ matrix.pixi-environment }} python -c "from pathlib import Path; [print(path) for path in sorted(Path('dist').glob('*'))]"
+
+#       # Run test_wheel.py directly to test pre-built wheel artifacts
+#       # We don't use `pixi run wheel_test` because it has a depends-on: wheel_build
+#       # which would rebuild the wheel instead of testing the downloaded artifact
+#       - name: Test wheel with uv
+#         if: steps.should_run.outputs.run == 'true'
+#         env:
+#           WHEEL_TEST_PYTHON_VERSION: cp${{ matrix.python-version == '3.12' && '312' || '313' }}
+#           WHEEL_TEST_TYPE: ${{ matrix.wheel-type }}
+#         run: pixi run -e ${{ matrix.pixi-environment }} python scripts/test_wheel.py
+
+#   # GPU smoke tests require a runner with a visible CUDA device and a driver
+#   # new enough for the CUDA PyTorch build. Windows GPU wheels are still covered
+#   # by the regular install/import tests above; the strict CUDA execution test is
+#   # Linux-only because the available Windows GPU runner driver is too old for
+#   # cu129.
+#   test_gpu_wheels_with_cuda:
+#     name: Test GPU wheel with CUDA - py${{ matrix.python-version }}-${{ matrix.os-short }}
+#     needs: [build_gpu_wheels_linux]
+#     runs-on: ${{ matrix.os }}
+#     strategy:
+#       fail-fast: false
+#       matrix:
+#         include:
+#           - os: 4-core-ubuntu-gpu-t4
+#             os-short: linux-gpu
+#             python-version: '3.12'
+#             artifact-pattern: wheels-gpu-linux
+#             require-triton: "true"
+#           - os: 4-core-ubuntu-gpu-t4
+#             os-short: linux-gpu
+#             python-version: '3.13'
+#             artifact-pattern: wheels-gpu-linux
+#             require-triton: "true"
+
+#     steps:
+#       - name: Set up Python
+#         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+#         with:
+#           python-version: ${{ matrix.python-version }}
+
+#       # Skip Python 3.13 tests on regular commits (same logic as builds).
+#       - name: Check if should run
+#         id: should_run
+#         env:
+#           MATRIX_PYTHON_VERSION: ${{ matrix.python-version }}
+#           RUN_PY313: ${{ startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && (github.event.inputs.publish == 'true' || github.event.inputs.force_all_builds == 'true')) }}
+#         run: python -c "import os; run = os.environ['MATRIX_PYTHON_VERSION'] != '3.13' or os.environ['RUN_PY313'] == 'true'; print('run=' + str(run).lower(), file=open(os.environ['GITHUB_OUTPUT'], 'a'))"
+
+#       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+#         if: steps.should_run.outputs.run == 'true'
+
+#       - name: Download wheel artifacts
+#         if: steps.should_run.outputs.run == 'true'
+#         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+#         with:
+#           path: dist
+#           pattern: ${{ matrix.artifact-pattern }}
+#           merge-multiple: true
+
+#       - name: List downloaded wheels
+#         if: steps.should_run.outputs.run == 'true'
+#         run: python -c "from pathlib import Path; [print(path) for path in sorted(Path('dist').glob('*'))]"
+
+#       - name: Test GPU wheel with CUDA
+#         if: steps.should_run.outputs.run == 'true'
+#         env:
+#           WHEEL_TEST_PYTHON_VERSION: cp${{ matrix.python-version == '3.12' && '312' || '313' }}
+#           WHEEL_TEST_TYPE: gpu
+#           WHEEL_TEST_REQUIRE_CUDA: "1"
+#           WHEEL_TEST_REQUIRE_TRITON: ${{ matrix.require-triton }}
+#           WHEEL_TEST_FORCE_LOCAL: "1"
+#         run: python scripts/test_wheel.py
+
+#   # PyPI/TestPyPI trusted publishing must be configured for each environment
+#   # name below before a release can publish these split distributions.
+#   publish_core:
+#     name: Publish pymomentum-core to PyPI
+#     needs: [build_core_and_cpu_wheels_linux, build_core_and_cpu_wheels, test_pip_wheels]
+#     runs-on: ubuntu-latest
+#     environment:
+#       name: pypi-core
+#       url: https://pypi.org/p/pymomentum-core
+#     permissions:
+#       id-token: write  # IMPORTANT: mandatory for trusted publishing
+#     # Only publish on tag push or manual workflow dispatch with publish=true
+#     if: |
+#       (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+#       (github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true')
+
+#     steps:
+#       - name: Download core wheel artifacts
+#         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+#         with:
+#           path: dist
+#           pattern: wheels-core-*
+#           merge-multiple: true
+
+#       - name: List core distributions
+#         run: ls -lh dist/
+
+#       - name: Publish core to TestPyPI
+#         if: |
+#           github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true' && github.event.inputs.test_pypi == 'true'
+#         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+#         with:
+#           repository-url: https://test.pypi.org/legacy/
+
+#       - name: Publish core to PyPI
+#         if: |
+#           (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+#           (github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true' && github.event.inputs.test_pypi != 'true')
+#         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+
+#   publish_cpu:
+#     name: Publish pymomentum-cpu to PyPI
+#     needs: [build_core_and_cpu_wheels_linux, build_core_and_cpu_wheels, test_pip_wheels]
+#     runs-on: ubuntu-latest
+#     environment:
+#       name: pypi-cpu
+#       url: https://pypi.org/p/pymomentum-cpu
+#     permissions:
+#       id-token: write  # IMPORTANT: mandatory for trusted publishing
+#     # Only publish on tag push or manual workflow dispatch with publish=true
+#     if: |
+#       (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+#       (github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true')
+
+#     steps:
+#       - name: Download CPU wheel artifacts
+#         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+#         with:
+#           path: dist
+#           pattern: wheels-cpu-*
+#           merge-multiple: true
+
+#       - name: List CPU distributions
+#         run: ls -lh dist/
+
+#       - name: Publish CPU to TestPyPI
+#         if: |
+#           github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true' && github.event.inputs.test_pypi == 'true'
+#         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+#         with:
+#           repository-url: https://test.pypi.org/legacy/
+
+#       - name: Publish CPU to PyPI
+#         if: |
+#           (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+#           (github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true' && github.event.inputs.test_pypi != 'true')
+#         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+
+#   publish_gpu:
+#     name: Publish pymomentum-gpu to PyPI
+#     needs: [build_gpu_wheels, build_gpu_wheels_linux, test_pip_wheels, test_gpu_wheels_with_cuda]
+#     runs-on: ubuntu-latest
+#     environment:
+#       name: pypi-gpu
+#       url: https://pypi.org/p/pymomentum-gpu
+#     permissions:
+#       id-token: write  # IMPORTANT: mandatory for trusted publishing
+#     # Only publish on tag push or manual workflow dispatch with publish=true
+#     if: |
+#       (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+#       (github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true')
+
+#     steps:
+#       - name: Download GPU wheel artifacts
+#         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+#         with:
+#           path: dist
+#           pattern: wheels-gpu-*
+#           merge-multiple: true
+
+#       - name: List GPU distributions
+#         run: ls -lh dist/
+
+#       - name: Publish GPU to TestPyPI
+#         if: |
+#           github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true' && github.event.inputs.test_pypi == 'true'
+#         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+#         with:
+#           repository-url: https://test.pypi.org/legacy/
+
+#       - name: Publish GPU to PyPI
+#         if: |
+#           (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+#           (github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true' && github.event.inputs.test_pypi != 'true')
+#         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
